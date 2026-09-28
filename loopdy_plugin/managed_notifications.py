@@ -43,6 +43,19 @@ _UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _PROFILE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 _CRON_SESSION = re.compile(r"^cron_.+_\d{8}_\d{6}$")
+
+
+def _is_scheduled_silence(response: Any) -> bool:
+    """True when a scheduled run replied with Hermes's cron silence marker (e.g. ``[SILENT]``).
+
+    Uses the same predicate the cron scheduler uses to skip delivery, so a run that stays
+    silent on its delivery lane never reaches the phone as a push either.
+    """
+    try:
+        from gateway.response_filters import is_autonomous_silence_response
+    except ImportError:
+        return isinstance(response, str) and response.strip().upper().startswith("[SILENT]")
+    return is_autonomous_silence_response(response)
 _EVENT_TYPES = {
     "session.completed", "session.failed", "scheduled.completed", "scheduled.failed",
     "approval.required", "clarification.required", "subagent.completed", "subagent.failed",
@@ -740,8 +753,14 @@ class ManagedNotifications:
         turn = payload.get("turn_id")
         if hook == "post_llm_call" and isinstance(turn, str) and _ID.fullmatch(turn):
             coordinate = (profile, session_id, turn)
+            scheduled = payload.get("platform") == "cron" or _CRON_SESSION.fullmatch(session_id) is not None
             try:
-                response_text = self._rich_text(payload.get("assistant_response"))
+                # A silent scheduled run keeps no reply, so neither this alert nor the
+                # on_session_end fallback pushes the marker. Failures still alert.
+                if scheduled and _is_scheduled_silence(payload.get("assistant_response")):
+                    response_text = ""
+                else:
+                    response_text = self._rich_text(payload.get("assistant_response"))
             except ManagedNotificationError:
                 response_text = ""
             if response_text:
@@ -754,7 +773,6 @@ class ManagedNotifications:
             # reply is saved. on_session_end comes only after post-turn work (external memory
             # sync, reviews) that can take several seconds, so the reply alert goes out now.
             if response_text and not child_hook:
-                scheduled = payload.get("platform") == "cron" or _CRON_SESSION.fullmatch(session_id) is not None
                 try:
                     self._queue_event(profile, session_id, turn,
                                       "scheduled.completed" if scheduled else "session.completed",

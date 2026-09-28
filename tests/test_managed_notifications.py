@@ -234,6 +234,30 @@ class ManagedNotificationTests(unittest.TestCase):
         self.service.drain_pending()
         self.assertIn("scheduled.completed",[e["eventType"] for e in self.events_sent()])
 
+    def test_silent_scheduled_run_sends_no_alert(self):
+        # Regression: a cron run answering "[SILENT]" skipped Telegram delivery but
+        # still reached the phone as a push reading "[SILENT]".
+        self.grant["eventTypes"]=["scheduled.completed","scheduled.failed","session.completed","session.failed"]
+        grant_id=str(uuid.uuid4()); self.grant["grantId"]=grant_id; self.grant_id=grant_id
+        self.service.enroll(grant_id,str(uuid.uuid4())); self.calls.clear()
+        cron="cron_143638f07ae3_20260927_185802"
+        for turn,reply in (("turn-s","[SILENT]"),("turn-t","[SILENT] No qualifying restock.")):
+            self.service.observe("post_llm_call",profile="default",session_id=cron,turn_id=turn,assistant_response=reply,platform="cron")
+            self.service.observe("on_session_end",profile="default",session_id=cron,turn_id=turn,completed=True,platform="cron")
+        self.service.drain_pending()
+        self.assertEqual(self.events_sent(),[])
+        self.service.observe("post_llm_call",profile="default",session_id=cron,turn_id="turn-r",assistant_response="Restock: ETB in stock at MSRP.",platform="cron")
+        self.service.observe("on_session_end",profile="default",session_id=cron,turn_id="turn-r",completed=True,platform="cron")
+        self.service.observe("on_session_end",profile="default",session_id=cron,turn_id="turn-f",failed=True,error="provider unreachable",platform="cron")
+        self.service.drain_pending()
+        self.assertEqual([e["eventType"] for e in self.events_sent()],["scheduled.completed","scheduled.failed"])
+
+    def test_silence_marker_in_chat_still_alerts(self):
+        self.service.observe("post_llm_call",profile="default",session_id="desktop-chat",turn_id="turn-a",assistant_response="[SILENT]")
+        self.service.observe("on_session_end",profile="default",session_id="desktop-chat",turn_id="turn-a",completed=True,platform="desktop")
+        self.service.drain_pending()
+        self.assertEqual([e["eventType"] for e in self.events_sent()],["session.completed"])
+
     def test_subagent_completion_alerts_for_an_unopened_parent_session(self):
         self.grant["eventTypes"]=["session.completed","session.failed","subagent.completed","subagent.failed"]
         grant_id=str(uuid.uuid4()); self.grant["grantId"]=grant_id; self.grant_id=grant_id
